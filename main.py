@@ -1,17 +1,16 @@
 # File: api/index.py
 import os
-import sys
 import joblib
 import pandas as pd
 import numpy as np
 import requests
 import shutil
-from typing import List
+import threading
+from typing import List, Dict
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field as PydanticField
 from pathlib import Path
-import threading
 
 # --- Configuration Constants ---
 MODEL_URL = os.getenv(
@@ -28,11 +27,19 @@ FEATURE_COLUMNS_URL = os.getenv(
 )
 TEMP_DIR = Path("/tmp/models")
 
-# --- Globals for Models and a Lock for thread-safe loading ---
+# --- Globals to Manage Model Loading State ---
+# These variables will control the API's readiness.
+models_state: Dict[str, any] = {
+    "is_loading": False,
+    "is_ready": False,
+    "error": None
+}
+# A lock to prevent multiple threads from modifying the state at the same time.
+state_lock = threading.Lock()
+
 MODEL = None
 LABEL_ENCODER = None
 FEATURE_COLUMNS = None
-model_loading_lock = threading.Lock()
 
 # --- Pydantic Models ---
 class PredictionFeatures(BaseModel):
@@ -46,7 +53,7 @@ class PredictionFeatures(BaseModel):
     Projects: int = PydanticField(..., example=3, ge=0)
     Field_Specific_Courses: int = PydanticField(..., example=4, ge=0)
     Coding_Skills: int = PydanticField(..., example=3, ge=0, le=5)
-    Communication_Skills: int = PydanticField(..., example=3, ge=0, le=5)
+    Communication_Skills: int = PdanticField(..., example=3, ge=0, le=5)
     Problem_Solving_Skills: int = PydanticField(..., example=4, ge=0, le=5)
     Teamwork_Skills: int = PydanticField(..., example=3, ge=0, le=5)
     Analytical_Skills: int = PydanticField(..., example=3, ge=0, le=5)
@@ -74,83 +81,88 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Helper Functions and Model Loading ---
+# --- Background Model Loading ---
 def download_file(url: str, destination: Path):
-    print(f"Downloading from {url} to {destination}")
-    try:
-        with requests.get(url, stream=True, timeout=120) as r:
-            r.raise_for_status()
-            with open(destination, 'wb') as f:
-                shutil.copyfileobj(r.raw, f)
-        print(f"Download successful: {destination}")
-        return True
-    except requests.exceptions.RequestException as e:
-        print(f"Error downloading {url}: {e}")
-        return False
+    print(f"Downloading {url}...")
+    # Increased timeout for large files
+    with requests.get(url, stream=True, timeout=300) as r:
+        r.raise_for_status()
+        with open(destination, 'wb') as f:
+            shutil.copyfileobj(r.raw, f)
+    print(f"Successfully downloaded {destination.name}")
 
-def load_models():
+def load_models_background():
     """
-    Downloads and loads the ML models into the global variables.
-    This function is designed to be called only when needed.
+    This function runs in a separate thread. It downloads and loads the models,
+    updating the global state dictionary upon completion or failure.
     """
     global MODEL, LABEL_ENCODER, FEATURE_COLUMNS
     
-    # Ensure this runs only once
-    with model_loading_lock:
-        # Check again in case another thread finished loading while we were waiting
-        if MODEL is not None:
-            return
+    with state_lock:
+        models_state["is_loading"] = True
 
-        print("--- First request: Loading ML Models ---")
+    try:
         TEMP_DIR.mkdir(parents=True, exist_ok=True)
-        
         model_path = TEMP_DIR / "model.joblib"
         encoder_path = TEMP_DIR / "encoder.joblib"
         features_path = TEMP_DIR / "features.joblib"
 
-        # Download all necessary files
-        model_ok = download_file(MODEL_URL, model_path)
-        encoder_ok = download_file(LABEL_ENCODER_URL, encoder_path)
-        features_ok = download_file(FEATURE_COLUMNS_URL, features_path)
+        # Download all files first
+        download_file(MODEL_URL, model_path)
+        download_file(LABEL_ENCODER_URL, encoder_path)
+        download_file(FEATURE_COLUMNS_URL, features_path)
         
-        if not (model_ok and encoder_ok and features_ok):
-            print("FATAL: A required model component failed to download.")
-            # Clear globals so the next request tries again
-            MODEL, LABEL_ENCODER, FEATURE_COLUMNS = None, None, None
-            raise HTTPException(status_code=503, detail="Model components failed to download.")
+        print("All files downloaded. Loading into memory...")
+        MODEL = joblib.load(model_path)
+        LABEL_ENCODER = joblib.load(encoder_path)
+        FEATURE_COLUMNS = joblib.load(features_path)
+        print("--- All ML components loaded successfully. API is ready. ---")
+        
+        with state_lock:
+            models_state["is_ready"] = True
+            models_state["error"] = None
 
-        # Load models from files
-        try:
-            MODEL = joblib.load(model_path)
-            LABEL_ENCODER = joblib.load(encoder_path)
-            FEATURE_COLUMNS = joblib.load(features_path)
-            print("--- All ML components loaded successfully. API is ready. ---")
-        except Exception as e:
-            print(f"FATAL: Error loading models with joblib: {e}")
-            # Clear globals so the next request tries again
-            MODEL, LABEL_ENCODER, FEATURE_COLUMNS = None, None, None
-            raise HTTPException(status_code=503, detail=f"Error loading models: {e}")
+    except Exception as e:
+        error_message = f"Failed to load models: {e}"
+        print(error_message)
+        with state_lock:
+            models_state["error"] = error_message
+    finally:
+        with state_lock:
+            models_state["is_loading"] = False
 
 
+# --- FastAPI Lifespan Events ---
+@app.on_event("startup")
+async def startup_event():
+    """
+    On startup, create and start the background thread for model loading.
+    The server does NOT wait for it to finish.
+    """
+    print("--- FastAPI starting up. Kicking off background model loading. ---")
+    thread = threading.Thread(target=load_models_background)
+    thread.start()
+
+
+# --- API Endpoints ---
 @app.get("/")
 def read_root():
-    # If models are loaded, status is "ready", otherwise "sleeping"
-    status = "ready" if MODEL is not None else "sleeping"
-    return {"status": status}
+    """Root endpoint to check the current status of the model loading."""
+    return {"status": "ok", "model_status": models_state}
 
 @app.post("/predict/", response_model=PredictionOutput)
 def predict_career_api(payload: PredictionInput):
     """
-    Receives features, ensures models are loaded, makes a prediction,
-    and returns top 5 results.
+    Receives features, checks model readiness, and returns predictions.
     """
-    # Load models only if they haven't been loaded yet
-    if MODEL is None:
-        load_models()
+    if models_state["is_loading"]:
+        raise HTTPException(status_code=503, detail="Models are still being loaded. Please try again in a minute.")
     
-    # After load_models, if they are still None, it means loading failed.
-    if MODEL is None:
-        raise HTTPException(status_code=503, detail="Models are not available. Please try again later.")
+    if models_state["error"]:
+        raise HTTPException(status_code=500, detail=f"Model loading failed: {models_state['error']}")
+        
+    if not models_state["is_ready"]:
+        raise HTTPException(status_code=503, detail="Models are not ready. Unknown state.")
 
     try:
         input_df = pd.DataFrame([payload.features.dict()])

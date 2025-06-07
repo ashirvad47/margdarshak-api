@@ -42,6 +42,7 @@ LABEL_ENCODER = None
 FEATURE_COLUMNS = None
 
 # --- Pydantic Models ---
+# --- Pydantic Models ---
 class PredictionFeatures(BaseModel):
     Field: str = PydanticField(..., example="B.Tech CSE")
     GPA: float = PydanticField(..., example=8.5)
@@ -53,7 +54,7 @@ class PredictionFeatures(BaseModel):
     Projects: int = PydanticField(..., example=3, ge=0)
     Field_Specific_Courses: int = PydanticField(..., example=4, ge=0)
     Coding_Skills: int = PydanticField(..., example=3, ge=0, le=5)
-    Communication_Skills: int = PdanticField(..., example=3, ge=0, le=5)
+    Communication_Skills: int = PydanticField(..., example=3, ge=0, le=5) # Corrected this line
     Problem_Solving_Skills: int = PydanticField(..., example=4, ge=0, le=5)
     Teamwork_Skills: int = PydanticField(..., example=3, ge=0, le=5)
     Analytical_Skills: int = PydanticField(..., example=3, ge=0, le=5)

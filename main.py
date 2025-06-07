@@ -1,81 +1,44 @@
 # File: api/index.py
 import os
+import sys
 import joblib
 import pandas as pd
 import numpy as np
 import requests
 import shutil
-import threading
-from typing import List, Dict
+from typing import List
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field as PydanticField
 from pathlib import Path
 
 # --- Configuration Constants ---
-# Only the main model pipeline is needed now.
+
+# Use environment variables for deployment, with hardcoded fallbacks for easy local testing.
+# Set these variables in your Vercel project settings.
 MODEL_URL = os.getenv(
     "MODEL_URL",
     "https://career-pred.s3.ap-south-1.amazonaws.com/models/career_prediction_model_pipeline.joblib"
 )
+LABEL_ENCODER_URL = os.getenv(
+    "LABEL_ENCODER_URL",
+    "https://career-pred.s3.ap-south-1.amazonaws.com/models/career_label_encoder.joblib"
+)
+FEATURE_COLUMNS_URL = os.getenv(
+    "FEATURE_COLUMNS_URL",
+    "https://career-pred.s3.ap-south-1.amazonaws.com/models/career_feature_columns.joblib.joblib"
+)
+# Vercel provides a writable /tmp directory
 TEMP_DIR = Path("/tmp/models")
 
-
-# --- Hardcoded Model Data ---
-# By hardcoding these, we avoid two extra downloads on startup.
-
-# 1. Feature Columns List (from your .joblib file)
-FEATURE_COLUMNS = [
-    'Field', 'GPA', 'Extracurricular_Activities', 'Internships', 'Projects', 
-    'Leadership_Positions', 'Field_Specific_Courses', 'Research_Experience', 
-    'Coding_Skills', 'Communication_Skills', 'Problem_Solving_Skills', 
-    'Teamwork_Skills', 'Analytical_Skills', 'Presentation_Skills', 
-    'Networking_Skills', 'Industry_Certifications'
-]
-
-# 2. Career Classes List (from your LabelEncoder .joblib file)
-CAREER_CLASSES = [
-    'AI / Machine Learning Engineer', 'Actuarial Analyst', 'Advertising Manager', 
-    'Aerospace Engineer', 'Analytical Chemist', 'Animator', 'Architect', 
-    'Art Director', 'Biochemist', 'Biologist', 'Biomedical Engineer', 
-    'Brand Manager', 'Business Analyst', 'Chartered Accountant', 
-    'Chef / Culinary Artist', 'Chemical Engineer', 'Civil Engineer', 
-    'Clinical Psychologist', 'Cloud Solutions Architect', 'Content Writer', 
-    'Corporate Lawyer', 'Cost Accountant', 'Counseling Psychologist', 
-    'Credit Analyst', 'Curator / Gallery Manager', 'Curriculum Developer', 
-    'Cybersecurity Analyst', 'Data Center Engineer', 'Data Scientist', 'Dentist', 
-    'DevOps Engineer', 'Digital Marketing Spec.', 'Doctor (MBBS)', 
-    'Ecologist / Conservation Scientist', 'Education Administrator', 
-    'Electrical Engineer', 'Electronics & Communication', 'Entrepreneur / Founder', 
-    'Environmental Engineer', 'Environmental Scientist', 'Fashion Designer', 
-    'Film / Video Editor', 'Financial Advisor', 'Financial Analyst', 
-    'Financial Controller', 'Fine Artist / Painter', 'Geneticist', 
-    'Graphic Designer', 'HR Manager', 'Hospitality Manager', 
-    'Hotel Operations Manager', 'IT Project Manager', 'Illustrator', 
-    'Industrial Engineer', 'Inorganic Chemist', 'Interior Designer', 
-    'Investment Banker', 'Judge', 'Landscape Architect', 'Lawyer', 'Legal Consultant', 
-    'Management Consultant', 'Market Research Analyst', 'Marketing Manager', 
-    'Mathematician / Statistician', 'Mechanical Engineer', 
-    'Medical Laboratory Technologist', 'Microbiologist', 'Mobile App Developer', 
-    'Music Teacher', 'Music Therapist', 'Nuclear Physicist', 'Nurse', 
-    'Nutritionist / Dietitian', 'Organic Chemist', 'Paralegal', 
-    'Petroleum Engineer', 'Pharmacist', 'Physicist', 'Physiotherapist', 
-    'Primary School Teacher', 'Public Health Specialist', 'Quantum Physicist', 
-    'Radiographer / Imaging Technologist', 'Risk Analyst', 'School Counselor', 
-    'School Principal', 'Secondary School Teacher', 'Social Media Manager', 
-    'Social Worker', 'Software Developer', 'Sound Engineer', 
-    'Special Education Teacher', 'Structural Engineer', 'Surgeon', 
-    'Talent Acquisition Spec.', 'UX/UI Designer', 'University Professor', 
-    'Urban Planner', 'Web Developer'
-]
-
-
-# --- Globals for Model Loading ---
-models_state: Dict[str, any] = {"is_loading": False, "is_ready": False, "error": None}
-state_lock = threading.Lock()
+# Global variables to hold the loaded models
 MODEL = None
+LABEL_ENCODER = None
+FEATURE_COLUMNS = None
+models_loaded_successfully = False
 
-# --- Pydantic Models ---
+# --- Pydantic Models for Input and Output ---
+
 class PredictionFeatures(BaseModel):
     Field: str = PydanticField(..., example="B.Tech CSE")
     GPA: float = PydanticField(..., example=8.5)
@@ -101,71 +64,82 @@ class CareerPrediction(BaseModel):
     career: str
     probability: float
 
+# *** FIXED RESPONSE MODEL ***
+# This now matches what the Next.js frontend action expects to receive.
 class PredictionOutput(BaseModel):
     top_predictions: List[CareerPrediction]
 
 # --- FastAPI App Initialization ---
 app = FastAPI(title="Career Prediction API")
+
+# --- IMPORTANT: Add CORS Middleware ---
+# This allows your Vercel frontend to make requests to this API.
 app.add_middleware(
     CORSMiddleware,
+    # In production, replace "*" with your frontend's Vercel URL
+    # e.g., allow_origins=["[https://your-app-name.vercel.app](https://your-app-name.vercel.app)"]
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Background Model Loading ---
-def load_model_background():
-    global MODEL
-    with state_lock:
-        models_state["is_loading"] = True
-
+# --- Helper Functions and Lifespan Events ---
+def download_file(url: str, destination: Path):
+    print(f"Downloading from {url} to {destination}")
     try:
-        TEMP_DIR.mkdir(parents=True, exist_ok=True)
-        model_path = TEMP_DIR / "model.joblib"
-        
-        print(f"Downloading model from {MODEL_URL}...")
-        with requests.get(MODEL_URL, stream=True, timeout=300) as r:
+        with requests.get(url, stream=True, timeout=120) as r:
             r.raise_for_status()
-            with open(model_path, 'wb') as f:
+            with open(destination, 'wb') as f:
                 shutil.copyfileobj(r.raw, f)
-        print("Model downloaded. Loading into memory...")
-        
-        MODEL = joblib.load(model_path)
-        print("--- Model loaded successfully. API is ready. ---")
-        
-        with state_lock:
-            models_state["is_ready"] = True
-    except Exception as e:
-        error_message = f"Failed to load model: {e}"
-        print(error_message)
-        with state_lock:
-            models_state["error"] = error_message
-    finally:
-        with state_lock:
-            models_state["is_loading"] = False
+        print(f"Download successful: {destination}")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"Error downloading {url}: {e}")
+        return False
 
-# --- FastAPI Lifespan Events ---
 @app.on_event("startup")
 async def startup_event():
-    print("--- FastAPI starting up. Kicking off background model loading. ---")
-    thread = threading.Thread(target=load_model_background)
-    thread.start()
+    """Load ML components when the application starts."""
+    global MODEL, LABEL_ENCODER, FEATURE_COLUMNS, models_loaded_successfully
+    
+    print("--- FastAPI Startup Event: Loading ML Models ---")
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Define file paths
+    model_path = TEMP_DIR / "model.joblib"
+    encoder_path = TEMP_DIR / "encoder.joblib"
+    features_path = TEMP_DIR / "features.joblib"
 
-# --- API Endpoints ---
+    # Download all necessary files
+    model_ok = download_file(MODEL_URL, model_path)
+    encoder_ok = download_file(LABEL_ENCODER_URL, encoder_path)
+    features_ok = download_file(FEATURE_COLUMNS_URL, features_path)
+    
+    if not (model_ok and encoder_ok and features_ok):
+        print("FATAL: A required model component failed to download.")
+        return # Models will remain None, and the flag will be False
+
+    # Load models from files
+    try:
+        MODEL = joblib.load(model_path)
+        LABEL_ENCODER = joblib.load(encoder_path)
+        FEATURE_COLUMNS = joblib.load(features_path)
+        models_loaded_successfully = True
+        print("--- All ML components loaded successfully. API is ready. ---")
+    except Exception as e:
+        print(f"FATAL: Error loading models with joblib: {e}")
+
 @app.get("/")
 def read_root():
-    return {"status": "ok", "model_status": models_state}
+    return {"status": "ok", "models_loaded": models_loaded_successfully}
 
 @app.post("/predict/", response_model=PredictionOutput)
 def predict_career_api(payload: PredictionInput):
-    if models_state["is_loading"]:
-        raise HTTPException(status_code=503, detail="Model is still being loaded. Please try again in a minute.")
-    if models_state["error"]:
-        raise HTTPException(status_code=500, detail=f"Model loading failed: {models_state['error']}")
-    if not models_state["is_ready"]:
-        raise HTTPException(status_code=503, detail="Model is not ready. Unknown state.")
-
+    """Receives candidate features, makes a prediction, and returns top 5 results."""
+    if not models_loaded_successfully:
+        raise HTTPException(status_code=503, detail="Models are not available. Please try again later.")
+    
     try:
         input_df = pd.DataFrame([payload.features.dict()])
         input_df = input_df.reindex(columns=FEATURE_COLUMNS, fill_value=0)
@@ -175,12 +149,13 @@ def predict_career_api(payload: PredictionInput):
         
         top_predictions_list = [
             CareerPrediction(
-                career=CAREER_CLASSES[i],  # Use the hardcoded list here
+                career=LABEL_ENCODER.classes_[i],
                 probability=round(float(probabilities[i]), 4)
             ) for i in top_n_indices
         ]
         
         return PredictionOutput(top_predictions=top_predictions_list)
+
     except Exception as e:
         print(f"An error occurred during prediction: {e}")
         raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")

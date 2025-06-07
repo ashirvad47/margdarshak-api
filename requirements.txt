@@ -1,9 +1,9 @@
-fastapi>=0.100.0
-uvicorn>=0.20.0       
-pydantic>=2.0.0
-scikit-learn
-numpy
-pandas
-joblib
-requests>=2.28.0     
+fastapi==0.115.12
+uvicorn>=0.20.0
+pydantic==2.11.5
+scikit-learn==1.6.1
+numpy==2.0.2
+pandas==2.2.2
+joblib==1.5.1
+requests==2.32.3
 python-multipart
